@@ -333,11 +333,11 @@ impl Store {
     }
 
     pub fn launch(&self) -> Result<Child> {
-        self.launch_with_args(&[])
+        self.launch_with_args(&["--serve-only"])
     }
 
     pub fn launch_preview(&self) -> Result<Child> {
-        self.launch_with_args(&["--preview"])
+        self.launch_with_args(&["--serve-only", "--preview"])
     }
 
     fn launch_with_args(&self, args: &[&str]) -> Result<Child> {
@@ -345,6 +345,9 @@ impl Store {
         let installed = self.installed()?.context("No installed game")?;
         let dir = self.game_dir(&installed)?;
         verify_files(&dir, &installed.artifact).context("Game files need repair")?;
+        if !args.contains(&"--serve-only") && !installed.artifact.files.iter().any(|file| file.path == "desktop/main.cjs") {
+            bail!("This installation predates the desktop game window. Install the current game package and try again.");
+        }
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -359,6 +362,7 @@ impl Store {
         command
             .args(args)
             .current_dir(&dir)
+            .env("ROULETTE_GAME_PROFILE", self.root.join("game-profile"))
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -392,15 +396,20 @@ fn extract(
         let expected = files
             .get(name.as_str())
             .context("Archive contains an unlisted file")?;
-        if !seen.insert(name.clone())
-            || !entry.is_file()
-            || entry.is_symlink()
-            || entry
-                .unix_mode()
-                .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o100000))
-            || entry.size() != expected.size
-        {
+        if !seen.insert(name.clone()) || entry.size() != expected.size {
             bail!("Archive entry has an unexpected type or size");
+        }
+        if let Some(target) = &expected.link_target {
+            let mut payload = Vec::new();
+            if !entry.is_symlink() || entry.take(4097).read_to_end(&mut payload)? > 4096
+                || payload != target.as_bytes() {
+                bail!("Archive contains an invalid framework alias");
+            }
+            continue;
+        }
+        if !entry.is_file() || entry.is_symlink() || entry.unix_mode()
+            .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o100000)) {
+            bail!("Archive entry must be a regular file");
         }
         let path = root.join(&name);
         fs::create_dir_all(path.parent().context("Archive entry has no parent")?)?;
@@ -411,13 +420,23 @@ fn extract(
         if std::io::copy(&mut entry.take(expected.size + 1), &mut output)? != expected.size {
             bail!("Extracted file has an unexpected size");
         }
-        if name == artifact.entrypoint {
+        if name == artifact.entrypoint || expected.executable {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 output.set_permissions(fs::Permissions::from_mode(0o755))?;
             }
         }
+    }
+    // Links are created after all writes, so extraction never traverses a link.
+    for expected in artifact.files.iter().filter(|file| file.link_target.is_some()) {
+        if cancelled.load(Ordering::Relaxed) { bail!("Installation cancelled"); }
+        let path = root.join(&expected.path);
+        let target = expected.link_target.as_deref().unwrap();
+        #[cfg(target_os = "macos")]
+        std::os::unix::fs::symlink(target, &path)?;
+        #[cfg(not(target_os = "macos"))]
+        { let _ = (path, target); bail!("Framework aliases are only supported on macOS"); }
     }
     verify_files(root, artifact)
 }
@@ -432,6 +451,13 @@ fn verify_files(root: &Path, artifact: &Artifact) -> Result<()> {
 
 fn verify_file(root: &Path, expected: &ArtifactFile) -> Result<()> {
     let path = root.join(&expected.path);
+    if let Some(target) = &expected.link_target {
+        if fs::read_link(&path)? != Path::new(target)
+            || !path.canonicalize()?.starts_with(root.join("runtime/Electron.app").canonicalize()?)
+            || hex::encode(Sha256::digest(target.as_bytes())) != expected.sha256.to_ascii_lowercase()
+        { bail!("Framework alias differs from its inventory"); }
+        return Ok(());
+    }
     if !path.canonicalize()?.starts_with(root.canonicalize()?)
         || !fs::symlink_metadata(&path)?.is_file()
     {
@@ -440,6 +466,13 @@ fn verify_file(root: &Path, expected: &ArtifactFile) -> Result<()> {
     let file = File::open(path)?;
     if file.metadata()?.len() != expected.size {
         bail!("File size differs");
+    }
+    #[cfg(unix)]
+    if expected.executable {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o100 == 0 {
+            bail!("Expected an executable file");
+        }
     }
     let mut hash = Sha256::new();
     std::io::copy(&mut file.take(expected.size + 1), &mut hash)?;
@@ -552,6 +585,8 @@ mod tests {
                 path: "game".into(),
                 size: 4,
                 sha256: hex::encode(Sha256::digest(b"game")),
+                executable: false,
+                link_target: None,
             }],
         }
     }

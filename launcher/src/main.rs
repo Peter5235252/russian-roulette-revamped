@@ -223,7 +223,29 @@ impl Launcher {
                             store.launch()?
                         };
                         let _ = tx.send(Event::Game(GameProcess(child)));
-                        Ok("Game running in your browser".into())
+                        
+                        // Launch chromium in app mode after the game starts
+                        let url = if local.is_some() {
+                            format!("http://{PREVIEW_ADDRESS}/")
+                        } else {
+                            format!("http://{GAME_ADDRESS}/")
+                        };
+                        let _ = std::thread::spawn(move || {
+                            let candidates = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"];
+                            for candidate in &candidates {
+                                if let Ok(_) = std::process::Command::new(candidate).output() {
+                                    let _ = std::process::Command::new(candidate)
+                                        .arg(format!("--app={url}"))
+                                        .arg("--no-first-run")
+                                        .arg("--no-default-browser-check")
+                                        .arg("--disable-features=TranslateUI,MediaRouter")
+                                        .spawn();
+                                    break;
+                                }
+                            }
+                        });
+                        
+                        Ok("Game running in Chromium.".into())
                     }
                     Action::Repair => {
                         if store.verify().is_err() {
