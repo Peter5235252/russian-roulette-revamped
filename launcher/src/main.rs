@@ -1,8 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use gpui::{
-    div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
-    PathPromptOptions, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
+    FocusHandle, KeyBinding, PathPromptOptions, Window, WindowBounds, WindowOptions,
 };
 use russian_roulette_launcher::{
     downloader::{fetch_manifest, Progress, ReleaseHttpStatus, MANIFEST_URL},
@@ -20,6 +20,8 @@ use std::{
     },
     time::Duration,
 };
+
+actions!(roulette_launcher, [FocusNext, FocusPrevious]);
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -55,6 +57,7 @@ impl Drop for GameProcess {
 }
 
 struct Launcher {
+    focus: FocusHandle,
     store: Store,
     local: Option<LocalPackage>,
     manifest: Option<ReleaseManifest>,
@@ -71,7 +74,14 @@ struct Launcher {
 }
 
 impl Launcher {
-    fn new(store: Store, local: Option<LocalPackage>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        store: Store,
+        local: Option<LocalPackage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        window.focus(&focus);
         let (installed, status) = match store.installed() {
             Ok(installed) => (installed, String::from("Checking for updates…")),
             Err(error) => (None, format!("Could not read installation: {error:#}")),
@@ -82,6 +92,7 @@ impl Launcher {
             "Install the local bundle to start testing."
         };
         let mut launcher = Self {
+            focus,
             store,
             manifest: local.as_ref().map(|package| package.manifest.clone()),
             local,
@@ -716,7 +727,10 @@ impl Render for Launcher {
             ));
         }
 
-        div().size_full().tab_group().id("launcher").overflow_y_scroll()
+        div().size_full().tab_group().id("launcher").track_focus(&self.focus)
+            .on_action(cx.listener(|_, _: &FocusNext, window, _| window.focus_next()))
+            .on_action(cx.listener(|_, _: &FocusPrevious, window, _| window.focus_prev()))
+            .overflow_y_scroll()
             .bg(rgb(0x151219)).text_color(rgb(0xf4ecf3))
             .p_5().flex().flex_col().gap_4()
             .child(div().w_full().flex().flex_col().gap_4().p_5().rounded_lg()
@@ -798,6 +812,10 @@ fn launch_config() -> anyhow::Result<(Store, Option<LocalPackage>)> {
 fn main() {
     let config = launch_config();
     Application::new().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrevious, None),
+        ]);
         let bounds = Bounds::centered(None, size(px(710.), px(535.)), cx);
         let window = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -809,7 +827,7 @@ fn main() {
             Ok((store, preview)) => cx
                 .open_window(window, |window, cx| {
                     window.set_window_title("Russian Roulette Revamped");
-                    cx.new(|cx| Launcher::new(store, preview, cx))
+                    cx.new(|cx| Launcher::new(store, preview, window, cx))
                 })
                 .map(drop),
             Err(error) => {
