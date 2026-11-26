@@ -30,11 +30,27 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Rust with the browser target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install the matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+
       - name: Install dependencies
         run: npm ci
 
+      - name: Check types and native rules
+        run: |
+          npm run lint
+          cargo test --locked -p russian-roulette-game-core
+
       - name: Build static site
         run: npm run build:pages
+
+      - name: Exercise compiled game rules
+        run: npm run test:wasm
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
