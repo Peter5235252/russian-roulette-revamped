@@ -127,6 +127,8 @@ export default function App() {
     roundsSurvived,
     shooter,
     target,
+    coreStatus,
+    coreError,
     buyItem,
     startGame,
     fireGun,
@@ -573,6 +575,11 @@ export default function App() {
           <p className="text-neutral-500 font-mono tracking-[0.25em] uppercase mb-10 text-xs">
             PULL THE TRIGGER. FACE THE DEALER.
           </p>
+          {coreStatus === 'failed' && (
+            <p role="alert" className="max-w-md mb-6 text-red-400 font-mono text-xs leading-relaxed">
+              Rust game core unavailable: {coreError || 'unknown loading error'}
+            </p>
+          )}
 
           <div className="flex flex-col items-center gap-4 mb-8 max-w-md w-full mx-auto px-2">
             {/* Minimalist Branch Selector: Classic vs Revamped */}
@@ -663,12 +670,13 @@ export default function App() {
                 elapsedMs: 0,
               });
             }}
-            className="btn-rusty px-10 py-3.5 min-h-[48px] text-base font-bold tracking-[0.25em] flex items-center justify-center gap-3 cursor-pointer"
+            disabled={coreStatus !== 'ready'}
+            className="btn-rusty px-10 py-3.5 min-h-[48px] text-base font-bold tracking-[0.25em] flex items-center justify-center gap-3 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {inputType === "gamepad" && (
               <ControllerGlyph role="confirm" layout={controllerLayout} size="lg" />
             )}
-            ENTER CHAMBER
+            {coreStatus === 'loading' ? 'LOADING GAME CORE' : 'ENTER CHAMBER'}
           </button>
         </div>
       ) : (

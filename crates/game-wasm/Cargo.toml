@@ -1,0 +1,15 @@
+[package]
+name = "russian-roulette-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Versioned wasm-bindgen boundary for the Russian Roulette game core"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+russian-roulette-game-core = { path = "../game-core" }
+serde.workspace = true
+serde-wasm-bindgen = "0.6.5"
+wasm-bindgen = "=0.2.130"
