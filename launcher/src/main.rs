@@ -1,14 +1,18 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use gpui::{
     div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
     PathPromptOptions, Window, WindowBounds, WindowOptions,
 };
 use russian_roulette_launcher::{
-    downloader::{fetch_manifest, Progress, MANIFEST_URL},
-    installer::{Installed, Store},
+    downloader::{fetch_manifest, Progress, ReleaseHttpStatus, MANIFEST_URL},
+    installer::{Installed, LocalPackage, Store},
     manifest::{ReleaseManifest, Target},
+    GAME_ADDRESS, LAUNCHER_VERSION, PREVIEW_ADDRESS,
 };
 use semver::Version;
 use std::{
+    path::{Path, PathBuf},
     process::Child,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -28,9 +32,15 @@ enum Action {
 
 enum Event {
     Progress(Progress),
-    Manifest(ReleaseManifest),
+    Manifest(Option<ReleaseManifest>),
     Game(GameProcess),
     Done(anyhow::Result<String>),
+}
+
+struct Operation {
+    action: Action,
+    events: mpsc::Receiver<Event>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct GameProcess(Child);
@@ -46,34 +56,49 @@ impl Drop for GameProcess {
 
 struct Launcher {
     store: Store,
+    local: Option<LocalPackage>,
     manifest: Option<ReleaseManifest>,
     installed: Option<Installed>,
     child: Option<GameProcess>,
-    operation: Option<(mpsc::Receiver<Event>, Arc<AtomicBool>)>,
+    operation: Option<Operation>,
     status: String,
+    status_error: bool,
     progress: Option<Progress>,
     confirm_uninstall: bool,
     choosing_folder: bool,
+    show_settings: bool,
+    stopping: bool,
 }
 
 impl Launcher {
-    fn new(store: Store, cx: &mut Context<Self>) -> Self {
+    fn new(store: Store, local: Option<LocalPackage>, cx: &mut Context<Self>) -> Self {
         let (installed, status) = match store.installed() {
             Ok(installed) => (installed, String::from("Checking for updates…")),
             Err(error) => (None, format!("Could not read installation: {error:#}")),
         };
+        let preview_status = if installed.is_some() {
+            "Ready to play the installed preview."
+        } else {
+            "Install the local bundle to start testing."
+        };
         let mut launcher = Self {
             store,
-            manifest: None,
+            manifest: local.as_ref().map(|package| package.manifest.clone()),
+            local,
             installed,
             child: None,
             operation: None,
             status,
+            status_error: false,
             progress: None,
             confirm_uninstall: false,
             choosing_folder: false,
+            show_settings: false,
+            stopping: false,
         };
-        if !launcher.store.root().join("manual-updates").exists() {
+        if launcher.local.is_some() {
+            launcher.status = preview_status.into();
+        } else if !launcher.store.root().join("manual-updates").exists() {
             launcher.run(Action::Check);
         } else if launcher.installed.is_some() {
             launcher.status = String::from("Ready to play");
@@ -113,13 +138,20 @@ impl Launcher {
         self.confirm_uninstall = false;
         let store = self.store.clone();
         let manifest = self.manifest.clone();
+        let local = self.local.clone();
         let (tx, rx) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
-        self.operation = Some((rx, cancelled));
+        self.operation = Some(Operation {
+            action,
+            events: rx,
+            cancelled,
+        });
+        self.status_error = false;
         self.status = match action {
             Action::Check => "Checking for updates…",
-            Action::Install => "Downloading…",
+            Action::Install if local.is_some() => "Verifying the local package…",
+            Action::Install => "Downloading the game…",
             Action::Play => "Verifying and starting the game…",
             Action::Repair => "Verifying game files…",
             Action::Uninstall => "Removing game files…",
@@ -135,21 +167,50 @@ impl Launcher {
             let result = (|| -> anyhow::Result<String> {
                 match action {
                     Action::Check => {
-                        let manifest = fetch_manifest(MANIFEST_URL)?;
+                        let manifest = match fetch_manifest(MANIFEST_URL) {
+                            Ok(manifest) => manifest,
+                            Err(error)
+                                if error
+                                    .downcast_ref::<ReleaseHttpStatus>()
+                                    .is_some_and(|status| status.0 == 404) =>
+                            {
+                                let _ = tx.send(Event::Manifest(None));
+                                return Ok("No public desktop release is available yet.".into());
+                            }
+                            Err(error) => return Err(error.context("Could not check for updates")),
+                        };
                         manifest.artifact_for(&Target::current()?)?;
-                        let _ = tx.send(Event::Manifest(manifest));
-                        Ok("Release information is up to date".into())
+                        let up_to_date = store.installed()?.is_some_and(|installed| {
+                            version_is_current(&installed.version.0, &manifest.game_version)
+                        });
+                        let _ = tx.send(Event::Manifest(Some(manifest)));
+                        Ok(if up_to_date {
+                            "You have the latest game version."
+                        } else {
+                            "A game release is available."
+                        }
+                        .into())
                     }
                     Action::Install => {
-                        install(
-                            manifest
-                                .as_ref()
-                                .ok_or_else(|| anyhow::anyhow!("Check for a release first"))?,
-                        )?;
+                        if let Some(package) = &local {
+                            store.install_local(package, &worker_cancelled, |progress| {
+                                let _ = tx.send(Event::Progress(progress));
+                            })?;
+                        } else {
+                            install(
+                                manifest
+                                    .as_ref()
+                                    .ok_or_else(|| anyhow::anyhow!("Check for a release first"))?,
+                            )?;
+                        }
                         Ok("Installation verified and ready".into())
                     }
                     Action::Play => {
-                        let child = store.launch()?;
+                        let child = if local.is_some() {
+                            store.launch_preview()?
+                        } else {
+                            store.launch()?
+                        };
                         let _ = tx.send(Event::Game(GameProcess(child)));
                         Ok("Game running in your browser".into())
                     }
@@ -158,6 +219,15 @@ impl Launcher {
                             let installed = store
                                 .installed()?
                                 .ok_or_else(|| anyhow::anyhow!("No game is installed"))?;
+                            if let Some(package) = &local {
+                                if package.manifest.game_version != installed.version.0 {
+                                    anyhow::bail!("Repair requires local package {}. Use Update to install the newer package.", installed.version.0);
+                                }
+                                store.install_local(package, &worker_cancelled, |progress| {
+                                    let _ = tx.send(Event::Progress(progress));
+                                })?;
+                                return Ok("Game repaired and verified".into());
+                            }
                             let recovery = ReleaseManifest {
                                 schema_version: 1,
                                 game_version: installed.version.0,
@@ -225,15 +295,23 @@ impl Launcher {
 
     fn tick(&mut self) -> bool {
         let mut changed = false;
-        if let Some((rx, _)) = &self.operation {
+        if let Some(operation) = &self.operation {
             loop {
-                match rx.try_recv() {
+                match operation.events.try_recv() {
                     Ok(Event::Progress(p)) => {
                         self.progress = Some(p);
+                        if !operation.cancelled.load(Ordering::Relaxed) {
+                            self.status = if p.bytes >= p.total {
+                                "Verifying and installing game files…"
+                            } else {
+                                "Downloading the game…"
+                            }
+                            .into();
+                        }
                         changed = true;
                     }
                     Ok(Event::Manifest(manifest)) => {
-                        self.manifest = Some(manifest);
+                        self.manifest = manifest;
                         changed = true;
                     }
                     Ok(Event::Game(child)) => {
@@ -258,15 +336,18 @@ impl Launcher {
             match child.0.try_wait() {
                 Ok(Some(status)) => {
                     self.child = None;
-                    self.status = if status.success() {
-                        "Game closed".into()
+                    self.status_error = !(status.success() || self.stopping);
+                    self.status = if !self.status_error {
+                        "Game stopped.".into()
                     } else {
                         format!("Game exited with {status}. See game.log for details.")
                     };
+                    self.stopping = false;
                     changed = true;
                 }
                 Err(error) => {
                     self.status = format!("Could not read game status: {error}");
+                    self.status_error = true;
                     changed = true;
                 }
                 Ok(None) => {}
@@ -276,11 +357,13 @@ impl Launcher {
     }
 
     fn finish(&mut self, result: anyhow::Result<String>) {
+        self.status_error = result.is_err();
         self.status = result.unwrap_or_else(|error| format!("{error:#}"));
         match self.store.installed() {
             Ok(installed) => self.installed = installed,
             Err(error) => {
                 self.installed = None;
+                self.status_error = true;
                 self.status = format!("{} · Could not read installation: {error:#}", self.status);
             }
         }
@@ -291,262 +374,465 @@ impl Launcher {
 
 impl Drop for Launcher {
     fn drop(&mut self) {
-        if let Some((_, cancelled)) = &self.operation {
-            cancelled.store(true, Ordering::Relaxed);
+        if let Some(operation) = &self.operation {
+            operation.cancelled.store(true, Ordering::Relaxed);
         }
     }
+}
+
+fn version_is_current(installed: &str, offered: &str) -> bool {
+    match (Version::parse(installed), Version::parse(offered)) {
+        (Ok(installed), Ok(offered)) => installed >= offered,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ButtonStyle {
+    Primary,
+    Quiet,
+    Danger,
 }
 
 fn button(
     id: &'static str,
     label: &'static str,
     enabled: bool,
-    primary: bool,
+    style: ButtonStyle,
     cx: &Context<Launcher>,
-    action: impl Fn(&mut Launcher) + 'static,
+    action: impl Fn(&mut Launcher, &mut Context<Launcher>) + 'static,
 ) -> AnyElement {
-    let base = div()
-        .px_3()
+    let (background, hover, text) = match (style, enabled) {
+        (_, false) => (0x242229, 0x242229, 0xa5a0ab),
+        (ButtonStyle::Primary, true) => (0xac293c, 0xc7374c, 0xffffff),
+        (ButtonStyle::Quiet, true) => (0x302d36, 0x413c49, 0xf3eff3),
+        (ButtonStyle::Danger, true) => (0x46242c, 0x65303c, 0xffcbd3),
+    };
+    let control = div()
+        .px_4()
         .py_2()
+        .min_h(px(40.))
+        .flex()
+        .items_center()
         .rounded_md()
-        .bg(rgb(if primary && enabled {
-            0xa52635
-        } else {
-            0x24242b
-        }))
-        .text_color(rgb(if enabled { 0xf5f1f2 } else { 0x7c7883 }))
+        .border_1()
+        .border_color(rgb(background))
+        .bg(rgb(background))
+        .text_color(rgb(text))
+        .text_sm()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
         .child(label);
     if enabled {
-        base.id(id)
+        control
+            .id(id)
             .tab_index(0)
             .cursor_pointer()
-            .focus(|style| style.bg(rgb(0x63434b)))
-            .hover(|style| style.bg(rgb(0x80303c)))
+            .hover(move |element| element.bg(rgb(hover)))
+            .focus(|element| element.border_color(rgb(0xf1b2bd)))
             .on_click(cx.listener(move |launcher, _, _, cx| {
-                action(launcher);
+                action(launcher, cx);
                 cx.notify();
             }))
             .into_any_element()
     } else {
-        base.into_any_element()
+        control.into_any_element()
+    }
+}
+
+fn version_cell(title: &'static str, value: &str) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w(px(128.))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x39313b))
+        .bg(rgb(0x211d25))
+        .px_4()
+        .py_3()
+        .child(div().text_sm().text_color(rgb(0xbab0c0)).child(title))
+        .child(
+            div()
+                .text_lg()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(value.to_owned()),
+        )
+}
+
+fn progress_panel(progress: Progress) -> gpui::Div {
+    let fraction = if progress.total == 0 {
+        0.
+    } else {
+        progress.bytes as f32 / progress.total as f32
+    }
+    .clamp(0., 1.);
+    let size = format!(
+        "{:.1} / {:.1} MiB",
+        progress.bytes as f64 / 1048576.,
+        progress.total as f64 / 1048576.
+    );
+    let speed = if progress.bytes_per_second == 0 {
+        size
+    } else {
+        format!(
+            "{}  ·  {:.1} MiB/s",
+            size,
+            progress.bytes_per_second as f64 / 1048576.
+        )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .h(px(5.))
+                .w_full()
+                .overflow_hidden()
+                .rounded_md()
+                .bg(rgb(0x3c323d))
+                .child(div().h_full().w(gpui::relative(fraction)).bg(rgb(0xe85167))),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_sm()
+                .text_color(rgb(0xccc2ce))
+                .child(format!("{:.0}%", (fraction * 100.).floor()))
+                .child(speed),
+        )
+}
+
+impl Launcher {
+    fn open(&mut self, target: impl AsRef<std::ffi::OsStr>) {
+        if let Err(error) = open::that_detached(target) {
+            self.status = format!("Could not open the requested location: {error}");
+            self.status_error = true;
+        }
+    }
+
+    fn stop_game(&mut self) {
+        if let Some(child) = &mut self.child {
+            match child.0.kill() {
+                Ok(()) => {
+                    self.stopping = true;
+                    self.status = "Stopping the game…".into();
+                    self.status_error = false;
+                }
+                Err(error) => {
+                    self.status = format!("Could not stop the game: {error}");
+                    self.status_error = true;
+                }
+            }
+        }
     }
 }
 
 impl Render for Launcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use ButtonStyle::{Danger, Primary, Quiet};
+        let preview = self.local.is_some();
         let idle = self.operation.is_none() && !self.choosing_folder;
-        let ready = idle && self.child.is_none();
+        let running = self.child.is_some();
+        let ready = idle && !running;
         let installed = self.installed.as_ref().map(|i| i.version.0.as_str());
         let latest = self.manifest.as_ref().map(|m| m.game_version.as_str());
-        let update = installed.zip(latest).is_some_and(|(current, remote)| {
-            Version::parse(current).ok() < Version::parse(remote).ok()
-        });
-        let (primary, text, enabled) = match (installed, update) {
-            (None, _) => (Action::Install, "Install", ready && latest.is_some()),
-            (Some(_), true) => (Action::Install, "Update", ready),
-            _ => (Action::Play, "Play", ready),
-        };
+        let update = installed
+            .zip(latest)
+            .is_some_and(|(current, offered)| !version_is_current(current, offered));
         let notes = self
             .manifest
             .as_ref()
-            .and_then(|m| m.release_notes_url.clone());
-        let auto = !self.store.root().join("manual-updates").exists();
+            .and_then(|manifest| manifest.release_notes_url.clone());
+        let settings = self.show_settings;
         let store = self.store.root().to_path_buf();
         let logs = self.store.logs();
-        let progress = self.progress.map(|p| {
-            format!(
-                "{:.1} / {:.1} MiB · {:.1} MiB/s",
-                p.bytes as f64 / 1048576.0,
-                p.total as f64 / 1048576.0,
-                p.bytes_per_second as f64 / 1048576.0
-            )
+        let auto = !preview && !store.join("manual-updates").exists();
+        let cancellable = self.operation.as_ref().is_some_and(|operation| {
+            matches!(operation.action, Action::Install | Action::Repair)
+                && !operation.cancelled.load(Ordering::Relaxed)
         });
-        div()
-            .size_full()
-            .tab_group()
-            .id("launcher")
-            .overflow_y_scroll()
-            .bg(rgb(0x111115))
-            .text_color(rgb(0xf2eef0))
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .text_2xl()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("Russian Roulette Revamped"),
-            )
-            .child(div().text_color(rgb(0xc6bfc5)).child(format!(
-                "Installed   {}     ·     Available   {}",
-                installed.unwrap_or("—"),
-                latest.unwrap_or("—")
-            )))
-            .child(
-                div()
-                    .min_h(px(48.))
-                    .child(self.status.clone())
-                    .children(progress.map(|p| div().text_sm().child(p))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(button("primary", text, enabled, true, cx, move |l| {
-                        l.run(primary)
-                    }))
-                    .child(button(
-                        "offline-play",
-                        "Play installed",
-                        ready && update,
-                        false,
-                        cx,
-                        |l| l.run(Action::Play),
-                    ))
-                    .child(button("check", "Check for updates", idle, false, cx, |l| {
-                        l.run(Action::Check)
-                    }))
-                    .child(button(
-                        "notes",
-                        "Release notes",
-                        notes.is_some(),
-                        false,
-                        cx,
-                        move |l| {
-                            if let Some(url) = &notes {
-                                if let Err(error) = open::that(url) {
-                                    l.status = error.to_string();
-                                }
-                            }
-                        },
-                    ))
-                    .child(button("cancel", "Cancel", !idle, false, cx, |l| {
-                        if let Some((_, cancel)) = &l.operation {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                    }))
-                    .child(button(
-                        "stop",
-                        "Stop game",
-                        self.child.is_some(),
-                        false,
-                        cx,
-                        |l| {
-                            if let Some(child) = &mut l.child {
-                                let _ = child.0.kill();
-                            }
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(button(
-                        "repair",
-                        "Verify / repair",
-                        ready && installed.is_some(),
-                        false,
-                        cx,
-                        |l| l.run(Action::Repair),
-                    ))
-                    .child(button(
-                        "uninstall",
-                        if self.confirm_uninstall {
-                            "Confirm uninstall"
-                        } else {
-                            "Uninstall"
-                        },
-                        ready && installed.is_some(),
-                        false,
-                        cx,
-                        |l| l.run(Action::Uninstall),
-                    ))
-                    .child(button(
-                        "files",
-                        "Installation folder",
-                        true,
-                        false,
-                        cx,
-                        move |l| {
-                            if let Err(e) = open::that(&store) {
-                                l.status = e.to_string();
-                            }
-                        },
-                    ))
-                    .child(button("logs", "Logs", true, false, cx, move |l| {
-                        if let Err(e) = open::that(&logs) {
-                            l.status = e.to_string();
-                        }
-                    })),
-            )
-            .child(button(
-                "auto",
-                if auto {
-                    "Startup checks: On"
-                } else {
-                    "Startup checks: Off"
-                },
-                idle,
-                false,
+        let address = if preview {
+            PREVIEW_ADDRESS
+        } else {
+            GAME_ADDRESS
+        };
+        let mode = if preview {
+            "Local preview"
+        } else {
+            "Desktop launcher"
+        };
+        let text_status = if self.status_error {
+            0xffa6b5
+        } else {
+            0xe4dce7
+        };
+
+        let mut actions = div().flex().flex_wrap().items_center().gap_2();
+        if running {
+            actions = actions
+                .child(button(
+                    "browser",
+                    "Open in browser",
+                    !self.stopping,
+                    Primary,
+                    cx,
+                    move |l, _| l.open(format!("http://{address}/")),
+                ))
+                .child(button(
+                    "stop",
+                    "Stop game",
+                    !self.stopping,
+                    Quiet,
+                    cx,
+                    |l, _| l.stop_game(),
+                ));
+        } else {
+            let (action, title, enabled) = match (installed, update, latest) {
+                (None, _, Some(_)) => (Action::Install, "Install game", ready),
+                (None, _, None) => (Action::Install, "Install game", false),
+                (Some(_), true, _) => (Action::Install, "Install update", ready),
+                _ => (Action::Play, "Play game", ready),
+            };
+            actions = actions.child(button(
+                "primary",
+                title,
+                enabled,
+                Primary,
                 cx,
-                move |l| {
-                    let path = l.store.root().join("manual-updates");
-                    let result = if auto {
-                        std::fs::File::create(path).map(drop)
-                    } else {
-                        std::fs::remove_file(path)
-                    };
-                    if let Err(error) = result {
-                        l.status = error.to_string();
-                    }
+                move |l, _| l.run(action),
+            ));
+            if update {
+                actions = actions.child(button(
+                    "play-installed",
+                    "Play installed",
+                    ready,
+                    Quiet,
+                    cx,
+                    |l, _| l.run(Action::Play),
+                ));
+            }
+        }
+        if !preview {
+            actions = actions.child(button(
+                "check",
+                "Check for updates",
+                idle,
+                Quiet,
+                cx,
+                |l, _| l.run(Action::Check),
+            ));
+        }
+        if let Some(url) = notes {
+            actions = actions.child(button(
+                "release-notes",
+                "Release notes",
+                true,
+                Quiet,
+                cx,
+                move |l, _| l.open(&url),
+            ));
+        }
+        if cancellable {
+            actions = actions.child(button("cancel", "Cancel", true, Quiet, cx, |l, _| {
+                if let Some(operation) = &l.operation {
+                    operation.cancelled.store(true, Ordering::Relaxed);
+                    l.status = "Cancelling…".into();
+                }
+            }));
+        }
+
+        let mut maintenance = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .child(button(
+                "open-install",
+                "Installation folder",
+                true,
+                Quiet,
+                cx,
+                {
+                    let store = store.clone();
+                    move |l, _| l.open(&store)
                 },
             ))
-            .when(ready && installed.is_none(), |view| {
-                view.child(
-                    div()
-                        .id("choose-folder")
-                        .tab_index(0)
-                        .cursor_pointer()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x24242b))
-                        .focus(|style| style.bg(rgb(0x63434b)))
-                        .child("Change installation folder")
-                        .on_click(cx.listener(|launcher, _, _, cx| {
-                            launcher.choose_folder(cx);
-                            cx.notify();
-                        })),
-                )
+            .child(button("open-logs", "Logs", true, Quiet, cx, move |l, _| {
+                l.open(&logs)
+            }));
+        if installed.is_some() {
+            maintenance = maintenance
+                .child(button(
+                    "repair",
+                    "Verify or repair",
+                    ready,
+                    Quiet,
+                    cx,
+                    |l, _| l.run(Action::Repair),
+                ))
+                .child(button(
+                    "uninstall",
+                    "Uninstall…",
+                    ready,
+                    Danger,
+                    cx,
+                    |l, _| {
+                        l.confirm_uninstall = true;
+                    },
+                ));
+        } else if !preview {
+            maintenance = maintenance.child(button(
+                "choose-folder",
+                "Change folder…",
+                ready,
+                Quiet,
+                cx,
+                |l, cx| l.choose_folder(cx),
+            ));
+        }
+        if !preview {
+            maintenance = maintenance.child(button(
+                "startup-checks",
+                if auto {
+                    "Startup checks on"
+                } else {
+                    "Startup checks off"
+                },
+                idle,
+                Quiet,
+                cx,
+                move |l, _| {
+                    let switch = l.store.root().join("manual-updates");
+                    let result = if auto {
+                        std::fs::File::create(switch).map(drop)
+                    } else {
+                        std::fs::remove_file(switch)
+                    };
+                    if let Err(error) = result {
+                        l.status = format!("Could not save update preferences: {error}");
+                        l.status_error = true;
+                    }
+                },
+            ));
+        }
+
+        div().size_full().tab_group().id("launcher").overflow_y_scroll()
+            .bg(rgb(0x151219)).text_color(rgb(0xf4ecf3))
+            .p_5().flex().flex_col().gap_4()
+            .child(div().w_full().flex().flex_col().gap_4().p_5().rounded_lg()
+                .border_1().border_color(rgb(0x51303d)).bg(rgb(0x2a1924))
+                .child(div().flex().items_center().justify_between().gap_2()
+                    .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(0xffbac6)).child(mode))
+                    .child(div().text_sm().text_color(rgb(0xd4becd)).child(format!("Launcher {LAUNCHER_VERSION}"))))
+                .child(div().text_2xl().font_weight(gpui::FontWeight::BOLD).child("Russian Roulette Revamped"))
+                .child(div().flex().flex_wrap().gap_3()
+                    .child(version_cell("Installed", installed.unwrap_or("Not installed")))
+                    .child(version_cell(if preview { "Local bundle" } else { "Latest release" }, latest.unwrap_or("Unavailable"))))
+            )
+            .child(div().p_4().rounded_md().border_1().border_color(rgb(0x3a323e)).bg(rgb(0x211b25))
+                .flex().flex_col().gap_3()
+                .child(div().text_color(rgb(text_status)).child(self.status.clone()))
+                .children(self.progress.map(progress_panel))
+                .child(actions))
+            .child(div().flex().justify_between().items_center().gap_2()
+                .child(div().text_sm().text_color(rgb(0xbab0c0)).child(Target::current().map(|t| t.to_string()).unwrap_or_default()))
+                .child(button("settings", if settings { "Hide settings" } else { "Settings & files" }, true, Quiet, cx, |l, _| {
+                    l.show_settings = !l.show_settings;
+                    l.confirm_uninstall = false;
+                })))
+            .when(settings, |view| {
+                view.child(div().p_4().flex().flex_col().gap_3().rounded_md().border_1().border_color(rgb(0x3a323e)).bg(rgb(0x211b25))
+                    .child(div().text_sm().text_color(rgb(0xccc2ce)).child(store.display().to_string()))
+                    .child(maintenance)
+                    .when(self.confirm_uninstall && ready, |settings| {
+                        settings.child(div().p_3().rounded_md().bg(rgb(0x39232e)).flex().flex_col().gap_2()
+                            .child("Remove the active game files? Your browser settings and logs will stay.")
+                            .child(div().flex().flex_wrap().gap_2()
+                                .child(button("keep-game", "Keep game", true, Quiet, cx, |l, _| l.confirm_uninstall = false))
+                                .child(button("confirm-remove", "Remove game", true, Danger, cx, |l, _| l.run(Action::Uninstall)))))
+                    }))
             })
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let store = match std::env::var_os("ROULETTE_INSTALL_DIR") {
-        Some(path) => Store::new(std::path::PathBuf::from(path).join("roulette-revamped"))?,
-        None => Store::preferred()?,
-    };
+struct StartupError(String);
+
+impl Render for StartupError {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p_6()
+            .size_full()
+            .bg(rgb(0x151219))
+            .text_color(rgb(0xf4ecf3))
+            .child(div().text_xl().child("Could not start the launcher"))
+            .child(div().mt_3().child(self.0.clone()))
+    }
+}
+
+fn launch_config() -> anyhow::Result<(Store, Option<LocalPackage>)> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [] => {
+            let store = match std::env::var_os("ROULETTE_INSTALL_DIR") {
+                Some(path) => Store::new(PathBuf::from(path).join("roulette-revamped"))?,
+                None => Store::preferred()?,
+            };
+            Ok((store, None))
+        }
+        [flag, directory, version, state] if flag == "--local-package" => {
+            let version = Version::parse(
+                version
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Preview version must be UTF-8"))?,
+            )?;
+            let package = LocalPackage::open(Path::new(directory), &version)?;
+            let store = Store::new(Path::new(state).join("roulette-preview"))?;
+            Ok((store, Some(package)))
+        }
+        _ => anyhow::bail!(
+            "Usage: roulette-launcher [--local-package DIRECTORY VERSION STATE_DIRECTORY]"
+        ),
+    }
+}
+
+fn main() {
+    let config = launch_config();
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(660.), px(410.)), cx);
-        if let Err(error) = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| {
-                window.set_window_title("Russian Roulette Revamped");
-                cx.new(|cx| Launcher::new(store, cx))
-            },
-        ) {
+        let bounds = Bounds::centered(None, size(px(710.), px(535.)), cx);
+        let window = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(420.), px(350.))),
+            app_id: Some("io.github.Peter5235252.RouletteRevamped".into()),
+            ..Default::default()
+        };
+        let opened = match config {
+            Ok((store, preview)) => cx
+                .open_window(window, |window, cx| {
+                    window.set_window_title("Russian Roulette Revamped");
+                    cx.new(|cx| Launcher::new(store, preview, cx))
+                })
+                .map(drop),
+            Err(error) => {
+                let message = format!("{error:#}");
+                eprintln!("{message}");
+                cx.open_window(window, |window, cx| {
+                    window.set_window_title("Russian Roulette Revamped");
+                    cx.new(|_| StartupError(message))
+                })
+                .map(drop)
+            }
+        };
+        if let Err(error) = opened {
             eprintln!("Could not open launcher: {error}");
             cx.quit();
+        } else {
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
         }
-        cx.activate(true);
     });
-    Ok(())
 }

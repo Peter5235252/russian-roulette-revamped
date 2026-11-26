@@ -1,24 +1,27 @@
 //! Serves the packaged game over a stable loopback origin for browser storage.
 use anyhow::{bail, Result};
+use russian_roulette_launcher::{GAME_ADDRESS, PREVIEW_ADDRESS};
 use std::{fs::File, path::Path};
 use tiny_http::{Header, Method, Response, Server};
 
-const ADDRESS: &str = "127.0.0.1:53483";
-
 fn main() -> Result<()> {
-    let serve_only = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [option] if option == "--serve-only" => true,
-        _ => bail!("Usage: roulette-game [--serve-only]"),
-    };
+    let mut serve_only = false;
+    let mut address = GAME_ADDRESS;
+    for option in std::env::args().skip(1) {
+        match option.as_str() {
+            "--serve-only" => serve_only = true,
+            "--preview" => address = PREVIEW_ADDRESS,
+            _ => bail!("Usage: roulette-game [--serve-only] [--preview]"),
+        }
+    }
     let site = std::env::current_dir()?.join("site").canonicalize()?;
     if !site.join("index.html").is_file() {
         bail!("The installed site has no entry point");
     }
-    let server = Server::http(ADDRESS).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Server::http(address).map_err(|error| anyhow::anyhow!("{error}"))?;
     if !serve_only {
         open::that_detached_with_timeout(
-            format!("http://{ADDRESS}/"),
+            format!("http://{address}/"),
             std::time::Duration::from_secs(2),
         )?;
     }
@@ -26,7 +29,7 @@ fn main() -> Result<()> {
         let host_ok = request
             .headers()
             .iter()
-            .any(|header| header.field.equiv("Host") && header.value.as_str() == ADDRESS);
+            .any(|header| header.field.equiv("Host") && header.value.as_str() == address);
         if !host_ok || request.method() != &Method::Get {
             let _ = request.respond(Response::empty(403));
             continue;

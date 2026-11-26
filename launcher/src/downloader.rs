@@ -11,6 +11,10 @@ use tempfile::NamedTempFile;
 pub const MANIFEST_URL: &str =
     "https://github.com/Peter5235252/russian-roulette-revamped/releases/latest/download/manifest.json";
 
+#[derive(Debug, thiserror::Error)]
+#[error("Release server returned HTTP {0}")]
+pub struct ReleaseHttpStatus(pub u16);
+
 fn response(url: &str, resume: Option<(u64, &str)>) -> Result<ureq::Response> {
     let mut url = https_url(url)?;
     let agent = ureq::AgentBuilder::new()
@@ -26,9 +30,7 @@ fn response(url: &str, resume: Option<(u64, &str)>) -> Result<ureq::Response> {
                 .set("If-Range", validator);
         }
         let response = request.call().map_err(|error| match error {
-            ureq::Error::Status(code, _) => {
-                anyhow::anyhow!("Release server returned HTTP {code}")
-            }
+            ureq::Error::Status(code, _) => ReleaseHttpStatus(code).into(),
             ureq::Error::Transport(_) => {
                 anyhow::anyhow!("Could not connect to the release server")
             }

@@ -1,6 +1,8 @@
 use crate::{
     downloader::{download, Progress},
-    manifest::{validate_artifact, Artifact, ArtifactFile, Target},
+    manifest::{
+        validate_artifact, Artifact, ArtifactFile, ReleaseManifest, Target, MANIFEST_SCHEMA_VERSION,
+    },
     LAUNCHER_VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -32,6 +34,45 @@ pub struct VersionInfo(pub String);
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
+}
+
+/// An explicitly selected development bundle built by package-release.py.
+/// Its file inventory is local input. Public installs still use the HTTPS manifest.
+#[derive(Clone)]
+pub struct LocalPackage {
+    pub manifest: ReleaseManifest,
+    archive: PathBuf,
+}
+
+impl LocalPackage {
+    pub fn open(directory: &Path, version: &Version) -> Result<Self> {
+        let target = Target::current()?;
+        let file = File::open(directory.join(format!("{target}.json")))
+            .context("Could not open the local package inventory")?;
+        let mut metadata: serde_json::Value = serde_json::from_reader(file.take(2_000_000))
+            .context("Could not read the local package inventory")?;
+        metadata
+            .as_object_mut()
+            .context("Expected a local package inventory object")?
+            .insert(
+                "url".into(),
+                serde_json::Value::String("https://local-package.invalid/game.zip".into()),
+            );
+        let artifact: Artifact = serde_json::from_value(metadata)?;
+        let manifest = ReleaseManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            game_version: version.to_string(),
+            published_at: "local preview".into(),
+            release_notes_url: None,
+            minimum_launcher_version: None,
+            artifacts: vec![artifact],
+        };
+        manifest.artifact_for(&target)?;
+        Ok(Self {
+            manifest,
+            archive: directory.join(format!("game-{target}.zip")),
+        })
+    }
 }
 
 impl Store {
@@ -147,6 +188,58 @@ impl Store {
     ) -> Result<()> {
         let _lock = self.lock()?;
         let artifact = manifest.artifact_for(&Target::current()?)?;
+        self.check_install_version(manifest)?;
+        let mut archive = download(artifact, &self.root, cancelled, progress)?;
+        self.install_verified_zip(archive.as_file_mut(), manifest, artifact, cancelled)
+    }
+
+    pub fn install_local(
+        &self,
+        package: &LocalPackage,
+        cancelled: &AtomicBool,
+        mut progress: impl FnMut(Progress),
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let manifest = &package.manifest;
+        let artifact = manifest.artifact_for(&Target::current()?)?;
+        self.check_install_version(manifest)?;
+        let mut archive =
+            File::open(&package.archive).context("Could not open the local game ZIP")?;
+        if archive.metadata()?.len() != artifact.size {
+            bail!("Local package size does not match its inventory");
+        }
+        let mut buffer = [0; 65536];
+        let mut hash = Sha256::new();
+        let mut bytes = 0;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("Installation cancelled");
+            }
+            let count = archive.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes += count as u64;
+            if bytes > artifact.size {
+                bail!("Local package grew while reading it");
+            }
+            hash.update(&buffer[..count]);
+        }
+        if bytes != artifact.size
+            || !hex::encode(hash.finalize()).eq_ignore_ascii_case(&artifact.sha256)
+        {
+            bail!("Local package failed SHA-256 verification");
+        }
+        // File validation uses the same archive handle and extraction path as a release install.
+        progress(Progress {
+            bytes,
+            total: bytes,
+            bytes_per_second: 0,
+        });
+        self.install_verified_zip(&mut archive, manifest, artifact, cancelled)
+    }
+
+    fn check_install_version(&self, manifest: &ReleaseManifest) -> Result<()> {
         let version = Version::parse(&manifest.game_version)?;
         if let Some(minimum) = &manifest.minimum_launcher_version {
             if Version::parse(LAUNCHER_VERSION)? < Version::parse(minimum)? {
@@ -158,8 +251,7 @@ impl Store {
                 bail!("The installed version is newer than the manifest");
             }
         }
-        let mut archive = download(artifact, &self.root, cancelled, progress)?;
-        self.install_verified_zip(archive.as_file_mut(), manifest, artifact, cancelled)
+        Ok(())
     }
 
     fn install_verified_zip(
@@ -244,6 +336,10 @@ impl Store {
         self.launch_with_args(&[])
     }
 
+    pub fn launch_preview(&self) -> Result<Child> {
+        self.launch_with_args(&["--preview"])
+    }
+
     fn launch_with_args(&self, args: &[&str]) -> Result<Child> {
         let _lock = self.lock()?;
         let installed = self.installed()?.context("No installed game")?;
@@ -253,7 +349,14 @@ impl Store {
             .create(true)
             .append(true)
             .open(self.logs().join("game.log"))?;
-        Command::new(dir.join(&installed.artifact.entrypoint))
+        let mut command = Command::new(dir.join(&installed.artifact.entrypoint));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command
             .args(args)
             .current_dir(&dir)
             .stdin(Stdio::null())
@@ -355,37 +458,29 @@ mod tests {
     #[test]
     #[ignore = "requires native game and launcher artifacts from scripts/package-release.py"]
     fn packaged_release_lifecycle() -> Result<()> {
-        let target = Target::current()?.to_string();
         let path = PathBuf::from(
             std::env::var_os("ROULETTE_TEST_PACKAGE")
                 .context("Set ROULETTE_TEST_PACKAGE to the native bundle directory")?,
         );
-        // The release assembly stage supplies the final URL before publishing.
-        let mut metadata: serde_json::Value =
-            serde_json::from_reader(File::open(path.join(format!("{target}.json")))?)?;
-        metadata["url"] = serde_json::Value::String("https://example.test/game.zip".into());
-        let artifact: Artifact = serde_json::from_value(metadata)?;
-        validate_artifact(&artifact)?;
-        let mut archive = File::open(path.join(format!("game-{target}.zip")))?;
-        assert_eq!(archive.metadata()?.len(), artifact.size);
-        let mut hash = Sha256::new();
-        std::io::copy(&mut archive, &mut hash)?;
-        assert_eq!(hex::encode(hash.finalize()), artifact.sha256);
         let temporary = tempfile::tempdir()?;
         let store = Store::new(temporary.path().to_path_buf())?;
-        let mut release = crate::manifest::ReleaseManifest {
-            schema_version: 1,
-            game_version: "1.0.0".into(),
-            published_at: "2026-11-26".into(),
-            release_notes_url: None,
-            minimum_launcher_version: None,
-            artifacts: vec![artifact.clone()],
-        };
+        let first = LocalPackage::open(&path, &Version::new(1, 0, 0))?;
+        let next = LocalPackage::open(&path, &Version::new(1, 1, 0))?;
         let cancel = AtomicBool::new(false);
-        store.install_verified_zip(&mut archive, &release, &artifact, &cancel)?;
+        store.install_local(&first, &cancel, |_| {})?;
         store.verify()?;
-        release.game_version = "1.1.0".into();
-        store.install_verified_zip(&mut archive, &release, &artifact, &cancel)?;
+        let mut corrupted = next.clone();
+        corrupted.manifest.artifacts[0].sha256 = "0".repeat(64);
+        assert!(store.install_local(&corrupted, &cancel, |_| {}).is_err());
+        assert_eq!(
+            store
+                .installed()?
+                .context("Installation missing")?
+                .version
+                .0,
+            "1.0.0"
+        );
+        store.install_local(&next, &cancel, |_| {})?;
         assert_eq!(
             store
                 .installed()?
@@ -402,18 +497,20 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let mut server = RunningServer(store.launch_with_args(&["--serve-only"])?);
+        let mut server = RunningServer(store.launch_with_args(&["--serve-only", "--preview"])?);
         let client = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(1))
             .build();
+        let url = format!(
+            "http://{}/wasm/russian_roulette_wasm_bg.wasm",
+            crate::PREVIEW_ADDRESS
+        );
         let mut endpoint = None;
         for _ in 0..30 {
             if let Some(status) = server.0.try_wait()? {
                 bail!("Packaged binary exited with {status}");
             }
-            let response = client
-                .get("http://127.0.0.1:53483/wasm/russian_roulette_wasm_bg.wasm")
-                .call();
+            let response = client.get(&url).call();
             if let Ok(response) = response {
                 endpoint = Some(response);
                 break;
