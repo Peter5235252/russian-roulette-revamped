@@ -1,4 +1,5 @@
 import type { Chamber, Difficulty, GameBranch, ItemType, PlayerState } from '../types';
+import type { TacticalInput, TacticalDecision } from '../ai/tacticalEngine';
 
 /** Keep this in lockstep with `crates/game-wasm/src/lib.rs`. */
 export const GAME_CORE_API_VERSION = 1;
@@ -71,7 +72,12 @@ interface WasmModule {
   create_round: (input: unknown) => RoundResult;
   resolve_shot: (input: ShotRequest) => ShotResult;
   resolve_item: (input: ItemRequest) => ItemResult;
+  decide_classic_dealer: (input: TacticalInput & { itemRoll: number; mirrorRoll: number }) => ClassicDealerDecision;
 }
+
+type ClassicDealerDecision =
+  | Omit<Extract<TacticalDecision, { action: 'USE_ITEM' }>, 'reasoning'>
+  | Omit<Extract<TacticalDecision, { action: 'SHOOT' }>, 'reasoning'>;
 
 let gameCorePromise: Promise<WasmModule> | undefined;
 
@@ -114,4 +120,12 @@ export async function resolveCoreShot(request: ShotRequest): Promise<ShotResult>
 
 export async function resolveCoreItem(request: ItemRequest): Promise<ItemResult> {
   return (await loadGameCore()).resolve_item(request);
+}
+
+export async function decideCoreClassicDealer(input: TacticalInput): Promise<ClassicDealerDecision> {
+  return (await loadGameCore()).decide_classic_dealer({
+    ...input,
+    itemRoll: Math.random(),
+    mirrorRoll: Math.random(),
+  });
 }

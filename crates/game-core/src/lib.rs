@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod classic_dealer;
+pub use classic_dealer::{decide_classic_dealer_move, ClassicDealerInput, DealerDecision};
+
 pub const CYLINDER_SIZE: usize = 6;
 pub const API_VERSION: u32 = 1;
 const BASE_DAMAGE: i32 = 35;

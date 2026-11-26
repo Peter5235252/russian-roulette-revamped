@@ -67,6 +67,10 @@ try {
       const start = page.getByRole('button', { name: 'ENTER CHAMBER' });
       await start.waitFor();
       assert.ok(await start.isEnabled());
+      const branch = process.env.ROULETTE_BRANCH === 'CLASSIC' ? 'CLASSIC' : 'REVAMPED';
+      if (branch === 'CLASSIC') {
+        await page.getByRole('tab', { name: 'CLASSIC', exact: true }).click();
+      }
       if (process.env.ROULETTE_RENDERER === 'webgpu') {
         assert.ok(await page.evaluate(async () => !!(await navigator.gpu?.requestAdapter())),
           `${name} did not expose a WebGPU adapter in this environment`);
@@ -74,14 +78,14 @@ try {
         assert.ok(await page.evaluate(() => document.createElement('canvas').getContext('webgl2') !== null),
           `${name} did not expose WebGL 2 in this environment`);
       }
-      const expected = await page.evaluate(async (base) => {
+      const expected = await page.evaluate(async ({ base, branch }) => {
         const core = await import(base + 'wasm/russian_roulette_wasm.js');
         await core.default();
         const seed = Array.from({ length: 99 }, (_, i) => i + 1).find(candidate => {
-          const round = core.create_round({ branch: 'REVAMPED', difficulty: 'NORMAL', seed: candidate });
+          const round = core.create_round({ branch, difficulty: 'NORMAL', seed: candidate });
           return !round.chambers[0].isLive;
         });
-        const out = core.create_round({ branch: 'REVAMPED', difficulty: 'NORMAL', seed });
+        const out = core.create_round({ branch, difficulty: 'NORMAL', seed });
         const original = Crypto.prototype.getRandomValues;
         Crypto.prototype.getRandomValues = function (target) {
           if (target instanceof Uint32Array && target.length === 1) {
@@ -91,7 +95,7 @@ try {
           return original.call(this, target);
         };
         return out.liveCount;
-      }, url);
+      }, { base: url, branch });
       await start.click();
       const self = page.getByText('SHOOT SELF', { exact: true });
       await self.waitFor({ timeout: 45_000, state: 'attached' });
@@ -104,6 +108,11 @@ try {
       await page.waitForFunction(() =>
         [...document.querySelectorAll('span')].some(el => el.textContent === 'CYLINDER' && el.parentElement.textContent === 'CYLINDER5'),
         undefined, { timeout: 20_000 });
+      if (branch === 'CLASSIC') {
+        await page.waitForFunction(() =>
+          [...document.querySelectorAll('span')].some(el => el.textContent === 'CYLINDER' && el.parentElement.textContent === 'CYLINDER4'),
+          undefined, { timeout: 20_000 });
+      }
       await page.setViewportSize({ width: 820, height: 580 });
       if (process.env.ROULETTE_RENDERER === 'webgpu') {
         assert.ok(await page.evaluate(() => window.testRendererContexts.includes('webgpu')));

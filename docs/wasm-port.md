@@ -12,7 +12,7 @@ The reference is the TypeScript source at `8ad8622`. Treat the state transitions
 | Shooting, damage and turn retention | Rust owns shell consumption, target selection, damage, temporary protection, currency, and blank-shot retaliation. The compiled-module tests compare 384 combinations to the previous formulas. |
 | Item effects | Rust applies all 11 items. Compiled-module tests cover their ordinary effects, including the Classic mirror, the cigarette timer, and the Classic scalpel restriction. The browser layer keeps item messages and animation cues. |
 | Match progression, rematches and shop | React keeps round/match transitions, inventory drops, shop purchases, and victory carry-over. Emptying the cylinder with pliers now reloads the round instead of allowing a spent chamber to be selected. |
-| Dealer | The existing TypeScript tactical engine still selects dealer actions for every difficulty. Its shots and items resolve through the same Rust rules as the player's actions. |
+| Dealer | Rust selects Classic dealer actions using the same item priorities, caps and probability thresholds as the reference. Rust and compiled-module tests exercise that policy. The Revamped decision engine remains in TypeScript. Both branches resolve dealer shots and items through the Rust rules. |
 | HUD, menu, settings and rendering | The existing four HUD modes, Three.js arena, shader preloader, and WebGPU/WebGL 2 selection stay in the browser layer. |
 | Controls, audio and persistence | The browser continues to handle mouse, keyboard, touch, gamepad, haptics and Web Audio. Local storage retains preferences. Match progress was transient in the source. |
 

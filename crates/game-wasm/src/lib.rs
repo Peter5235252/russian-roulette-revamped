@@ -1,6 +1,6 @@
 use russian_roulette_game_core::{
-    create_round as core_create_round, resolve_item as core_resolve_item,
-    resolve_shot as core_resolve_shot,
+    create_round as core_create_round, decide_classic_dealer_move,
+    resolve_item as core_resolve_item, resolve_shot as core_resolve_shot,
 };
 use wasm_bindgen::prelude::*;
 
@@ -25,6 +25,11 @@ pub fn resolve_shot(input: JsValue) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn resolve_item(input: JsValue) -> Result<JsValue, JsValue> {
     transform(input, core_resolve_item)
+}
+
+#[wasm_bindgen]
+pub fn decide_classic_dealer(input: JsValue) -> Result<JsValue, JsValue> {
+    transform(input, decide_classic_dealer_move)
 }
 
 fn transform<Input, Output>(

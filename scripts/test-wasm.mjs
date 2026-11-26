@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import init, { api_version, create_round, resolve_item, resolve_shot } from '../dist/wasm/russian_roulette_wasm.js';
+import init, { api_version, create_round, decide_classic_dealer, resolve_item, resolve_shot } from '../dist/wasm/russian_roulette_wasm.js';
 
 const bytes = await readFile(new URL('../dist/wasm/russian_roulette_wasm_bg.wasm', import.meta.url));
 await init({ module_or_path: bytes });
@@ -95,4 +95,24 @@ test('compiled item effects preserve inventory, timestamps, changes to health an
   assert.equal(use('MIRROR', { branch: 'CLASSIC' }).chambers[1].isLive, true);
   assert.equal(use('MIRROR', { user: 'dealer', dealer: participant(75, 100, ['MIRROR']) }).dealerKnownShell, false);
   assert.throws(() => use('SCALPEL', { branch: 'CLASSIC' }), /scalpel/);
+});
+
+test('Classic dealer policy preserves source item priorities, gates and caps', () => {
+  const state = {
+    difficulty: 'NORMAL', player: participant(30), dealer: participant(32, 100, ['MIRROR', 'MEDKIT']),
+    liveCount: 2, blankCount: 2, knownCurrentShell: null, dealerDamageReductionActive: false,
+    itemsUsedThisTurn: 0, itemRoll: .77, mirrorRoll: .44,
+  };
+  const choose = (input = {}) => decide_classic_dealer({ ...state, ...input });
+  const use = (itemIndex) => ({ action: 'USE_ITEM', itemIndex });
+  const shoot = { action: 'SHOOT', target: 'dealer' };
+  assert.deepEqual(choose(), use(1));
+  assert.deepEqual(choose({ itemsUsedThisTurn: 1 }), shoot);
+  assert.deepEqual(choose({ itemRoll: .78 }), shoot);
+  const dealer = participant(80, 100, ['MIRROR', 'PLIERS']);
+  assert.deepEqual(choose({ dealer }), use(0));
+  assert.deepEqual(choose({ dealer, mirrorRoll: .45 }), shoot);
+  assert.deepEqual(choose({ dealer, knownCurrentShell: true }), use(1));
+  assert.deepEqual(choose({ dealer, liveCount: 0, knownCurrentShell: true }), shoot);
+  assert.deepEqual(choose({ dealer, difficulty: 'HARD', itemsUsedThisTurn: 1, itemRoll: .99, mirrorRoll: .99 }), use(0));
 });

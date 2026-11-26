@@ -4,7 +4,7 @@ import { DEADLY_QUOTES, getRandomItemsByDifficulty } from '../gameData';
 import { playStartAudio, startAmbientDrone, playGunshot, playEmptyClick, playItemSound, playBloodSplatter } from '../audio';
 import { vibrateGamepad } from '../controller';
 import { decideDealerMove } from '../ai/tacticalEngine';
-import { createCoreRound, loadGameCore, resolveCoreItem, resolveCoreShot, type ItemResult } from '../wasm/gameCore';
+import { createCoreRound, decideCoreClassicDealer, loadGameCore, resolveCoreItem, resolveCoreShot, type ItemResult } from '../wasm/gameCore';
 
 const INITIAL_HEALTH = 100;
 const CYLINDER_SIZE = 6;
@@ -497,9 +497,8 @@ export const useGameState = () => {
         }
 
         const now = Date.now();
-        const decision = decideDealerMove({
+        const input = {
           difficulty: latestRef.difficulty || 'NORMAL',
-          branch: latestRef.branch || 'REVAMPED',
           dealer: latestRef.dealer,
           player: latestRef.player,
           liveCount: lCount,
@@ -514,7 +513,18 @@ export const useGameState = () => {
             latestRef.playerDamageReductionEnd && now < latestRef.playerDamageReductionEnd
           ),
           itemsUsedThisTurn: dealerItemsUsedThisTurnRef.current,
-        });
+        };
+        let decision;
+        try {
+          decision = latestRef.branch === 'CLASSIC'
+            ? await decideCoreClassicDealer(input) : decideDealerMove(input);
+        } catch (error) {
+          aiRef.current = false;
+          setCoreStatus('failed');
+          setCoreError(error instanceof Error ? error.message : 'The Rust game core stopped responding.');
+          updateState({ gameState: 'MENU', message: 'Game core failure.', subMessage: '' });
+          return;
+        }
 
         aiRef.current = false;
         if (

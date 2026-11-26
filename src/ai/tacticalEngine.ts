@@ -1,8 +1,7 @@
-import { Difficulty, GameBranch, ItemType, PlayerState } from '../types';
+import { Difficulty, ItemType, PlayerState } from '../types';
 
 export interface TacticalInput {
   difficulty: Difficulty;
-  branch?: GameBranch;
   dealer: PlayerState;
   player: PlayerState;
   liveCount: number;
@@ -1052,116 +1051,8 @@ function decideNormalDealerMove(input: TacticalInput): TacticalDecision {
     : { action: 'SHOOT', target: 'dealer', reasoning: 'Normal: Risking self-shot.' };
 }
 
-// ============================================================================
-// CLASSIC BRANCH: SELF-TARGETED ROULETTE WITH ITEMS (SUPERNATURAL MIRROR, NO SCALPEL/2X)
-// ============================================================================
-
-function decideClassicDealerMove(input: TacticalInput): TacticalDecision {
-  const {
-    difficulty,
-    dealer,
-    player,
-    liveCount: l,
-    blankCount: b,
-    knownCurrentShell,
-    dealerDamageReductionActive,
-    itemsUsedThisTurn,
-  } = input;
-
-  const items = dealer.items;
-  const total = l + b;
-  const effectiveKnown = getEffectiveKnownShell(knownCurrentShell, l, b);
-  const pLive = effectiveKnown === true ? 1 : effectiveKnown === false ? 0 : total > 0 ? l / total : 0.5;
-  const isNormal = difficulty === 'NORMAL';
-  const isHard = difficulty === 'HARD';
-  const itemCap = isNormal ? 1 : isHard ? 2 : 3;
-
-  // Classic self-shot damage against Dealer is 35 HP (or 5 HP with Cigarette mitigation).
-  // Dealer NEVER uses SCALPEL (unavailable in Classic) or RAZORBLADE (harmful on self-shots).
-  const canUseItem = itemsUsedThisTurn < itemCap && (!isNormal || Math.random() < 0.78);
-
-  if (canUseItem) {
-    const missing = dealer.maxHealth - dealer.health;
-
-    // 1. Critical survival / healing
-    if (dealer.health <= 35 && items.includes('MEDKIT') && missing >= 25) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('MEDKIT'), reasoning: 'Classic: Medkit recovery at critical HP.' };
-    }
-    if (missing >= 50 && items.includes('MEDKIT')) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('MEDKIT'), reasoning: 'Classic: Medkit restoring heavy missing HP.' };
-    }
-    if ((missing >= 40 || (dealer.health <= 35 && missing >= 20)) && items.includes('SYRINGE')) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('SYRINGE'), reasoning: 'Classic: Syringe healing.' };
-    }
-    if (dealer.health <= 35 && dealer.maxHealth >= 30 && items.includes('DEFIBRILLATOR')) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('DEFIBRILLATOR'), reasoning: 'Classic: Emergency Defibrillator recovery.' };
-    }
-    if (player.health - dealer.health >= (isNormal ? 35 : 22) && items.includes('PENTAGRAM')) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('PENTAGRAM'), reasoning: 'Classic: Pentagram swap to seize HP lead.' };
-    }
-    if (missing >= 18 && dealer.health <= dealer.maxHealth - 18 && items.includes('WHISKEY')) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('WHISKEY'), reasoning: 'Classic: Whiskey recovery.' };
-    }
-
-    // 2. Supernatural Mirror: reveals current chamber AND curses an upcoming blank into LIVE!
-    if (
-      items.includes('MIRROR') &&
-      effectiveKnown === null &&
-      l > 0 &&
-      b > 0 &&
-      (!isNormal || Math.random() < 0.45)
-    ) {
-      return {
-        action: 'USE_ITEM',
-        itemIndex: items.indexOf('MIRROR'),
-        reasoning: 'Classic: Inspecting chamber and cursing an upcoming blank via supernatural Mirror.',
-      };
-    }
-
-    // 3. Pliers to safely discharge confirmed or high-probability live shells before pulling the trigger
-    const pliersThreshold = isNormal ? 0.62 : isHard ? 0.52 : 0.45;
-    if (
-      items.includes('PLIERS') &&
-      total > 1 &&
-      dealer.health > 10 &&
-      effectiveKnown !== false &&
-      (effectiveKnown === true || pLive >= pliersThreshold || (dealer.health <= 35 && pLive > 0))
-    ) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('PLIERS'), reasoning: 'Classic: Ejecting dangerous round with Pliers.' };
-    }
-
-    // 4. Cigarette to cushion incoming live self-shot damage (-30 HP)
-    if (
-      !dealerDamageReductionActive &&
-      l > 0 &&
-      effectiveKnown !== false &&
-      items.includes('CIGARETTE') &&
-      (effectiveKnown === true || dealer.health <= 45 || pLive >= (isNormal ? 0.55 : 0.42))
-    ) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('CIGARETTE'), reasoning: 'Classic: Lighting Cigarette to mitigate live pull.' };
-    }
-
-    // 5. Tourniquet buffer when inventory is full or before Medkit
-    if (items.includes('TOURNIQUET') && (items.length >= 7 || (dealer.health === dealer.maxHealth && items.includes('MEDKIT')))) {
-      return { action: 'USE_ITEM', itemIndex: items.indexOf('TOURNIQUET'), reasoning: 'Classic: Applying Tourniquet.' };
-    }
-  }
-
-  return {
-    action: 'SHOOT',
-    target: 'dealer',
-    reasoning: 'Classic Russian Roulette: Dealer pulls the trigger against himself.',
-  };
-}
-
-// ============================================================================
-// PUBLIC DISPATCHER
-// ============================================================================
-
+// The Revamped policy remains in TypeScript while its actions use the Rust rules.
 export function decideDealerMove(input: TacticalInput): TacticalDecision {
-  if (input.branch === 'CLASSIC') {
-    return decideClassicDealerMove(input);
-  }
 
   switch (input.difficulty) {
     case 'NIGHTMARE':
