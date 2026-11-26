@@ -4,13 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "dev": "npm run build:wasm && tsx server.ts",
+    "build": "npm run build:wasm && vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "build:pages": "vite build --base=./"
+    "test:core": "cargo test -p russian-roulette-game-core",
+    "test:wasm": "node --test scripts/test-wasm.mjs",
+    "build:wasm": "cargo build --locked -p russian-roulette-wasm --release --target wasm32-unknown-unknown && wasm-bindgen --target web --out-dir public/wasm --out-name russian_roulette_wasm target/wasm32-unknown-unknown/release/russian_roulette_wasm.wasm",
+    "build:pages": "npm run build:wasm && vite build --base=./ && node scripts/assert-pages-build.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
