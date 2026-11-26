@@ -29,15 +29,26 @@ enum Action {
 enum Event {
     Progress(Progress),
     Manifest(ReleaseManifest),
-    Game(Child),
+    Game(GameProcess),
     Done(anyhow::Result<String>),
+}
+
+struct GameProcess(Child);
+
+impl Drop for GameProcess {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 struct Launcher {
     store: Store,
     manifest: Option<ReleaseManifest>,
     installed: Option<Installed>,
-    child: Option<Child>,
+    child: Option<GameProcess>,
     operation: Option<(mpsc::Receiver<Event>, Arc<AtomicBool>)>,
     status: String,
     progress: Option<Progress>,
@@ -139,12 +150,7 @@ impl Launcher {
                     }
                     Action::Play => {
                         let child = store.launch()?;
-                        if let Err(mpsc::SendError(Event::Game(mut abandoned))) =
-                            tx.send(Event::Game(child))
-                        {
-                            let _ = abandoned.kill();
-                            let _ = abandoned.wait();
-                        }
+                        let _ = tx.send(Event::Game(GameProcess(child)));
                         Ok("Game running in your browser".into())
                     }
                     Action::Repair => {
@@ -249,7 +255,7 @@ impl Launcher {
             }
         }
         if let Some(child) = &mut self.child {
-            match child.try_wait() {
+            match child.0.try_wait() {
                 Ok(Some(status)) => {
                     self.child = None;
                     self.status = if status.success() {
@@ -287,18 +293,6 @@ impl Drop for Launcher {
     fn drop(&mut self) {
         if let Some((_, cancelled)) = &self.operation {
             cancelled.store(true, Ordering::Relaxed);
-        }
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some((receiver, _)) = self.operation.take() {
-            for event in receiver.try_iter() {
-                if let Event::Game(mut child) = event {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
         }
     }
 }
@@ -441,7 +435,7 @@ impl Render for Launcher {
                         cx,
                         |l| {
                             if let Some(child) = &mut l.child {
-                                let _ = child.kill();
+                                let _ = child.0.kill();
                             }
                         },
                     )),

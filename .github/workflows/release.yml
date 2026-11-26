@@ -76,6 +76,10 @@ jobs:
           name: game-site
           path: dist
       - run: python scripts/package-release.py package ${{ matrix.name }} dist target/${{ matrix.triple }}/release bundle
+      - name: Check packaged install, update and launch
+        env:
+          ROULETTE_TEST_PACKAGE: ${{ github.workspace }}/bundle
+        run: cargo test --locked -p russian-roulette-launcher --target ${{ matrix.triple }} packaged_release_lifecycle -- --ignored
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}

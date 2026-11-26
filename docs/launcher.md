@@ -1,6 +1,6 @@
 # Desktop launcher
 
-The GPUI launcher manages platform packages independently of the development server. Each package contains a small native executable and the same version of the WASM game that Pages builds. **Play** verifies the installed files, starts that executable with its install folder as the working directory, and opens the static game in the default browser at `http://127.0.0.1:53483/`. The stable local origin keeps browser preferences across updates. **Stop game** or closing the launcher stops the server. A browser with WebGL 2 or WebGPU is required.
+The GPUI launcher manages platform packages independently of the development server. Each package contains a small native executable and the same version of the WASM game that Pages builds. **Play** verifies the installed files, starts that executable with its install folder as the working directory, and opens the static game in the default browser at `http://127.0.0.1:53483/`. The stable local origin keeps browser preferences across updates. **Stop game** or closing the launcher stops the server. A browser with WebGL 2 or WebGPU is required. The original audio samples and preferred fonts are fetched from their existing CDNs when connected.
 
 ## Build targets
 
@@ -20,6 +20,6 @@ The installer compares semantic versions, verifies archive size and SHA-256, and
 
 ## Release
 
-Create a `vMAJOR.MINOR.PATCH` tag, then push the tag or run the release workflow for it. The workflow builds the browser site once and packages it with each native launcher and game server. It assembles checksums and `manifest.json` only after every native target succeeds. Artifacts upload to a draft before the release becomes visible. The launcher reads the manifest from the latest published release and downloads the selected target ZIP.
+Create a `vMAJOR.MINOR.PATCH` tag, then push the tag or run the release workflow for it. The workflow builds the browser site once and packages it with each native launcher and game server. Each native job smoke-tests a local install, version update, game-server launch, WASM fetch, and uninstall using its packaged archive. The workflow assembles checksums and `manifest.json` after all targets succeed. Artifacts upload to a draft before the release becomes visible. The launcher reads the manifest from the latest published release and downloads the selected target ZIP.
 
 The manifest includes schema version, game version, publication date, release notes URL, minimum launcher version, and platform archives with their HTTPS URLs, sizes, SHA-256 hashes, entrypoints, and file inventories. The launcher trusts the project's HTTPS GitHub release metadata as the source of checksums.

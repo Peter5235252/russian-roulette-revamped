@@ -30,10 +30,9 @@ try {
   const engines = [
     ['Chromium', chromium, {
       executablePath: process.env.ROULETTE_CHROMIUM,
-      args: ['--enable-unsafe-swiftshader', '--use-gl=angle',
-        ...(process.env.ROULETTE_RENDERER === 'webgpu'
-          ? ['--use-angle=swiftshader', '--enable-unsafe-webgpu']
-          : ['--use-angle=swiftshader-webgl'])],
+      args: process.env.ROULETTE_RENDERER === 'webgpu'
+        ? ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--ozone-platform=wayland']
+        : ['--enable-unsafe-swiftshader', '--use-gl=angle', '--use-angle=swiftshader-webgl'],
     }],
     ['Firefox', firefox, { firefoxUserPrefs: { 'webgl.force-enabled': true, 'dom.webgpu.enabled': false } }],
   ];
@@ -53,6 +52,15 @@ try {
       if (process.env.ROULETTE_RENDERER !== 'webgpu') {
         await page.addInitScript(() => Object.defineProperty(navigator, 'gpu', { value: undefined, configurable: true }));
       }
+      await page.addInitScript(() => {
+        const getContext = HTMLCanvasElement.prototype.getContext;
+        window.testRendererContexts = [];
+        HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+          const context = getContext.call(this, type, ...args);
+          if (context && (type === 'webgpu' || type === 'webgl2')) window.testRendererContexts.push(type);
+          return context;
+        };
+      });
       const wasm = page.waitForResponse((result) => result.url() === url + 'wasm/russian_roulette_wasm_bg.wasm');
       await page.goto(url);
       assert.equal((await wasm).status(), 200);
@@ -97,6 +105,9 @@ try {
         [...document.querySelectorAll('span')].some(el => el.textContent === 'CYLINDER' && el.parentElement.textContent === 'CYLINDER5'),
         undefined, { timeout: 20_000 });
       await page.setViewportSize({ width: 820, height: 580 });
+      if (process.env.ROULETTE_RENDERER === 'webgpu') {
+        assert.ok(await page.evaluate(() => window.testRendererContexts.includes('webgpu')));
+      }
       await page.reload();
       await start.waitFor();
       assert.deepEqual(errors, []);

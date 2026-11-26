@@ -42,11 +42,22 @@ impl Store {
     }
 
     pub fn new(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(root.join("versions"))?;
-        fs::create_dir_all(root.join("logs"))?;
-        Ok(Self {
-            root: root.canonicalize()?,
-        })
+        fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        for name in ["versions", "logs"] {
+            let directory = root.join(name);
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            if !fs::symlink_metadata(&directory)?.is_dir()
+                || directory.canonicalize()?.parent() != Some(root.as_path())
+            {
+                bail!("Managed {name} directory must be inside the installation folder");
+            }
+        }
+        Ok(Self { root })
     }
 
     pub fn save_location(&self, parent: &Path) -> Result<Store> {
@@ -148,11 +159,21 @@ impl Store {
             }
         }
         let mut archive = download(artifact, &self.root, cancelled, progress)?;
-        archive.as_file_mut().seek(SeekFrom::Start(0))?;
+        self.install_verified_zip(archive.as_file_mut(), manifest, artifact, cancelled)
+    }
+
+    fn install_verified_zip(
+        &self,
+        archive: &mut File,
+        manifest: &crate::manifest::ReleaseManifest,
+        artifact: &Artifact,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        archive.seek(SeekFrom::Start(0))?;
         let stage = tempfile::Builder::new()
             .prefix("game-")
             .tempdir_in(self.root.join("versions"))?;
-        extract(archive.as_file_mut(), stage.path(), artifact, cancelled)?;
+        extract(archive, stage.path(), artifact, cancelled)?;
         self.activate(stage, manifest, artifact, cancelled)
     }
 
@@ -220,6 +241,10 @@ impl Store {
     }
 
     pub fn launch(&self) -> Result<Child> {
+        self.launch_with_args(&[])
+    }
+
+    fn launch_with_args(&self, args: &[&str]) -> Result<Child> {
         let _lock = self.lock()?;
         let installed = self.installed()?.context("No installed game")?;
         let dir = self.game_dir(&installed)?;
@@ -229,6 +254,7 @@ impl Store {
             .append(true)
             .open(self.logs().join("game.log"))?;
         Command::new(dir.join(&installed.artifact.entrypoint))
+            .args(args)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -325,6 +351,85 @@ mod tests {
     use super::*;
     use crate::manifest::ArtifactFormat;
     use std::io::Write;
+
+    #[test]
+    #[ignore = "requires native game and launcher artifacts from scripts/package-release.py"]
+    fn packaged_release_lifecycle() -> Result<()> {
+        let target = Target::current()?.to_string();
+        let path = PathBuf::from(
+            std::env::var_os("ROULETTE_TEST_PACKAGE")
+                .context("Set ROULETTE_TEST_PACKAGE to the native bundle directory")?,
+        );
+        // The release assembly stage supplies the final URL before publishing.
+        let mut metadata: serde_json::Value =
+            serde_json::from_reader(File::open(path.join(format!("{target}.json")))?)?;
+        metadata["url"] = serde_json::Value::String("https://example.test/game.zip".into());
+        let artifact: Artifact = serde_json::from_value(metadata)?;
+        validate_artifact(&artifact)?;
+        let mut archive = File::open(path.join(format!("game-{target}.zip")))?;
+        assert_eq!(archive.metadata()?.len(), artifact.size);
+        let mut hash = Sha256::new();
+        std::io::copy(&mut archive, &mut hash)?;
+        assert_eq!(hex::encode(hash.finalize()), artifact.sha256);
+        let temporary = tempfile::tempdir()?;
+        let store = Store::new(temporary.path().to_path_buf())?;
+        let mut release = crate::manifest::ReleaseManifest {
+            schema_version: 1,
+            game_version: "1.0.0".into(),
+            published_at: "2026-11-26".into(),
+            release_notes_url: None,
+            minimum_launcher_version: None,
+            artifacts: vec![artifact.clone()],
+        };
+        let cancel = AtomicBool::new(false);
+        store.install_verified_zip(&mut archive, &release, &artifact, &cancel)?;
+        store.verify()?;
+        release.game_version = "1.1.0".into();
+        store.install_verified_zip(&mut archive, &release, &artifact, &cancel)?;
+        assert_eq!(
+            store
+                .installed()?
+                .context("Update did not activate")?
+                .version
+                .0,
+            "1.1.0"
+        );
+
+        struct RunningServer(Child);
+        impl Drop for RunningServer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut server = RunningServer(store.launch_with_args(&["--serve-only"])?);
+        let client = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(1))
+            .build();
+        let mut endpoint = None;
+        for _ in 0..30 {
+            if let Some(status) = server.0.try_wait()? {
+                bail!("Packaged binary exited with {status}");
+            }
+            let response = client
+                .get("http://127.0.0.1:53483/wasm/russian_roulette_wasm_bg.wasm")
+                .call();
+            if let Ok(response) = response {
+                endpoint = Some(response);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let response = endpoint.context("Packaged server failed to serve the game")?;
+        assert_eq!(response.header("Content-Type"), Some("application/wasm"));
+        let mut header = [0; 4];
+        response.into_reader().read_exact(&mut header)?;
+        assert_eq!(&header, b"\0asm");
+        drop(server);
+        store.uninstall()?;
+        assert!(store.installed()?.is_none());
+        Ok(())
+    }
 
     fn fixture(entries: &[(&str, &[u8])]) -> NamedTempFile {
         let mut archive = NamedTempFile::new().unwrap();
