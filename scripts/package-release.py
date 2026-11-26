@@ -5,8 +5,12 @@ import datetime
 import hashlib
 import json
 import pathlib
+import plistlib
 import re
 import shutil
+import subprocess
+import tempfile
+import tomllib
 import zipfile
 
 TARGETS = {"linux-x86_64", "windows-x86_64", "macos-x86_64", "macos-aarch64"}
@@ -22,6 +26,45 @@ def note(path, relative):
     return {"path": relative, "sha256": digest(path), "size": path.stat().st_size}
 
 
+def launcher_name(target):
+    suffix = ".exe" if target.startswith("windows-") else ".zip" if target.startswith("macos-") else ""
+    return f"roulette-launcher-{target}{suffix}"
+
+
+def package_launcher(target, binaries, output):
+    executable = binaries / ("roulette-launcher.exe" if target.startswith("windows-") else "roulette-launcher")
+    destination = output / launcher_name(target)
+    if not target.startswith("macos-"):
+        shutil.copyfile(executable, destination)
+        return
+
+    workspace = pathlib.Path(__file__).resolve().parents[1]
+    version = tomllib.loads((workspace / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]
+    with tempfile.TemporaryDirectory(prefix="roulette-app-") as directory:
+        app = pathlib.Path(directory) / "Russian Roulette Revamped.app"
+        contents = app / "Contents"
+        macos = contents / "MacOS"
+        macos.mkdir(parents=True)
+        installed = macos / executable.name
+        shutil.copy2(executable, installed)
+        installed.chmod(0o755)
+        with (contents / "Info.plist").open("wb") as plist:
+            plistlib.dump({
+                "CFBundleIdentifier": "io.github.Peter5235252.RouletteRevamped",
+                "CFBundleName": "Russian Roulette Revamped",
+                "CFBundleDisplayName": "Russian Roulette Revamped",
+                "CFBundlePackageType": "APPL",
+                "CFBundleExecutable": executable.name,
+                "CFBundleVersion": version,
+                "CFBundleShortVersionString": version,
+                "LSApplicationCategoryType": "public.app-category.games",
+                "NSHighResolutionCapable": True,
+            }, plist)
+        subprocess.run(["codesign", "--force", "--sign", "-", app], check=True)
+        subprocess.run(["codesign", "--verify", "--strict", app], check=True)
+        subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, destination.resolve()], check=True)
+
+
 def package(target, source, binaries, output):
     output.mkdir(parents=True, exist_ok=True)
     os_name, arch = target.split("-", 1)
@@ -34,7 +77,7 @@ def package(target, source, binaries, output):
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
         for file, relative in entries:
             bundle.write(file, relative)
-    shutil.copyfile(binaries / ("roulette-launcher" + suffix), output / f"roulette-launcher-{target}{suffix}")
+    package_launcher(target, binaries, output)
     metadata = {
         "target": {"os": os_name, "arch": arch},
         "format": "zip",
@@ -56,8 +99,7 @@ def manifest(tag, inputs, output):
         directory = inputs / target
         metadata = json.loads((directory / f"{target}.json").read_text(encoding="utf-8"))
         game = directory / f"game-{target}.zip"
-        suffix = ".exe" if target.startswith("windows-") else ""
-        launcher = directory / f"roulette-launcher-{target}{suffix}"
+        launcher = directory / launcher_name(target)
         if digest(game) != metadata["sha256"] or game.stat().st_size != metadata["size"]:
             raise ValueError(f"Invalid archive for {target}")
         for file in (game, launcher):
